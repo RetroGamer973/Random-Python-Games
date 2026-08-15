@@ -1,0 +1,1653 @@
+ #!/usr/bin/env python3
+"""
+MONSTER TAMER - touchscreen edition (Pygame)
+
+MODES (chosen from a start screen):
+    CLASSIC  - pick EASY / NORMAL / HARD. Each is a fixed round count
+               with its own monster difficulty; survive it to win.
+                   Easy   - 30 rounds, gentler monsters
+                   Normal - 50 rounds, standard monsters
+                   Hard   - 80 rounds, tougher monsters
+    QUEST    - catch a specific checklist of monsters per stage; each
+               of the 6 stages gets harder than the last, ending in a
+               final "all quests complete" win.
+    HARDCORE - Hard difficulty's monster stats, but Endless: no round
+               cap at all. Play until you die.
+
+SAVING: every mode has a SAVE button in the top bar during play. The
+start screen shows a CONTINUE option whenever a save exists, which
+resumes exactly where you left off (same cards, roster, XP, round).
+A run's save is cleared automatically once that run ends (win or
+lose), so CONTINUE never resumes a finished run.
+
+Core turn loop (all modes): 4 cards are dealt. Tap through ALL 4, one
+at a time, in any order - each one dims with a checkmark once you've
+dealt with it. Once all 4 are handled, the next hand deals
+automatically. No image assets required: monsters are drawn as a
+skull icon, potions as a triangle-shaped bottle, and capture balls as
+a simple two-tone orb.
+
+Monster popups show whichever of these apply:
+    CATCH  - if your Capture Level beats theirs (or it's round 1)
+    BATTLE - if you have an active monster
+    FLEE   - always available, zero risk. If a monster is too tough
+             to catch or battle right now, FLEE is your only option -
+             it never forces a loss.
+
+You only lose if: your last monster dies in battle, or you go 2 full
+rounds in a row with no active monster.
+
+The window is resizable (F11 toggles fullscreen) so fonts, icons, and
+buttons all scale up to fill your touchscreen.
+"""
+
+import json
+import math
+import os
+import random
+import sys
+
+# Touchscreens can make SDL emit BOTH a real touch event and a
+# synthesized mouse event for the same physical tap. Without this,
+# a single tap could fire our tap-handling twice against the same
+# (now-stale) button list, which used to crash the app.
+os.environ.setdefault("SDL_TOUCH_MOUSE_EVENTS", "0")
+os.environ.setdefault("SDL_MOUSE_TOUCH_EVENTS", "0")
+
+import pygame
+
+# ---------------------------------------------------------------- #
+# Config
+# ---------------------------------------------------------------- #
+START_WIDTH, START_HEIGHT = 900, 600
+FPS = 30
+STARTING_CAPTURE_LEVEL = 1
+STARTING_CAPTURE_BALLS = 2      # you need >=1 ball in hand to catch anything
+STARTING_PLAYER_HP = 30
+STARTING_CREDITS = 0
+
+# Credits earned for taking action in the field.
+CREDIT_PER_CATCH = 5
+CREDIT_PER_BATTLE_WIN = 4
+
+# Sword: lets you fight a monster even with no active monster of your own.
+# Fighting costs HP based on the monster's toughness instead of risking
+# your roster.
+SWORD_DAMAGE_FRACTION = 0.5     # fraction of monster HP you take per fight
+SHIELD_DAMAGE_REDUCTION = 0.5   # shield halves HP lost in battles/fights
+
+# Passive HP drain applied to the player after every battle/fight, but
+# only on Hard classic and Hardcore - the tougher modes take a toll.
+HARD_BATTLE_DAMAGE = (1, 4)
+
+SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monster_tamer_save.json")
+
+MONSTER_NAMES = [
+    "Gooey", "Horriblin", "Fang", "Wubat", "Impidimp", "Suhail", "Hexwisp",
+    "Serpent", "Golem", "Harpy", "Troll", "Wraith", "Drake", "Ogre",
+    # Named to match QUEST targets below (fixes quests 1-3 previously
+    # asking for monsters that could never spawn).
+    "Slime", "Goblin", "Wolf", "Bat",
+    # 5 new monsters.
+    "Chimera", "Banshee", "Cyclops", "Mimic", "Kraken",
+]
+
+# Shop: spend credits earned in the field on supplies and gear.
+SHOP_ITEMS = [
+    {"key": "ball", "label": "Capture Ball", "cost": 8,
+     "desc": "+1 Capture Ball - required to catch monsters"},
+    {"key": "potion", "label": "Potion", "cost": 6,
+     "desc": "+1 Potion - heals your active monster 8 HP, use anytime"},
+    {"key": "sword", "label": "Sword", "cost": 40,
+     "desc": "Fight monsters yourself, even with no active monster"},
+    {"key": "shield", "label": "Shield", "cost": 40,
+     "desc": "Halves the HP you lose in battles and sword fights"},
+]
+
+# In-game help overlay content: (heading, body text) pairs, wrapped
+# and rendered top-to-bottom.
+HELP_SECTIONS = [
+    ("The goal", "Each round deals 4 cards. Tap through all 4, in any order - "
+                  "each one dims with a checkmark once handled. The next hand "
+                  "then deals automatically."),
+    ("Monster cards", "Choose CATCH, BATTLE, FIGHT, or FLEE. CATCH needs a "
+                       "Capture Ball in hand, plus it's round 1 or your Capture "
+                       "Level beats the monster's. BATTLE needs an active "
+                       "monster - higher HP wins the fight. FIGHT uses your "
+                       "Sword to take the monster on yourself when you have no "
+                       "active monster (costs your own HP). FLEE is always "
+                       "safe and never causes a loss."),
+    ("Potion cards", "Instantly heal your active monster."),
+    ("Capture Ball cards", "Raise your Capture Level and add a Capture Ball to "
+                            "your bag for later catches."),
+    ("Shop", "Catching and battling earn credits. Tap SHOP in the top bar to "
+             "spend them on Capture Balls, Potions, a Sword, or a Shield "
+             "(halves HP lost in battles and sword fights)."),
+    ("Losing", "You lose if your last monster dies, you go 2 rounds in a row "
+               "with no active monster, or your own HP hits 0. Hard classic "
+               "and Hardcore also drain a little of your HP after every "
+               "battle or sword fight."),
+    ("Saving", "Tap SAVE any time during a run. CONTINUE on the start screen "
+               "resumes exactly where you left off - same cards, roster, XP, "
+               "and round."),
+]
+
+# Classic mode's three difficulties: round count + monster stat ranges.
+DIFFICULTIES = {
+    "easy":   {"label": "Easy",   "rounds": 30, "hp": (3, 12), "cl": (1, 6)},
+    "normal": {"label": "Normal", "rounds": 50, "hp": (4, 18), "cl": (1, 10)},
+    "hard":   {"label": "Hard",   "rounds": 80, "hp": (6, 22), "cl": (2, 13)},
+}
+
+# Quest mode: each stage has a checklist of monsters to catch, and
+# gets progressively harder (higher HP / capture level ranges).
+QUESTS = [
+    {"title": "Quest 1 - First Catch", "targets": {"Slime": 1, "Goblin": 1}, "hp": (4, 9), "cl": (1, 3)},
+    {"title": "Quest 2 - Pack Hunter", "targets": {"Wolf": 2, "Bat": 2}, "hp": (5, 11), "cl": (1, 4)},
+    {"title": "Quest 3 - Into the Dark", "targets": {"Impidimp": 2, "Hexwisp": 1, "Serpent": 1}, "hp": (6, 13), "cl": (2, 6)},
+    {"title": "Quest 4 - Stone and Steel", "targets": {"Golem": 1, "Harpy": 2, "Troll": 1}, "hp": (8, 15), "cl": (3, 7)},
+    {"title": "Quest 5 - Restless Spirits", "targets": {"Wraith": 2, "Suhail": 1}, "hp": (10, 17), "cl": (4, 8)},
+    {"title": "Quest 6 - Dragon's Lair", "targets": {"Drake": 1, "Ogre": 2}, "hp": (12, 18), "cl": (5, 10)},
+]
+
+# ---------------------------------------------------------------- #
+# Colors
+# ---------------------------------------------------------------- #
+BG = (18, 20, 28)
+PANEL = (28, 32, 48)
+PANEL_BORDER = (46, 52, 72)
+PANEL_BORDER_LIT = (90, 98, 130)
+GOLD = (217, 169, 79)
+GOLD_DARK = (120, 92, 40)
+RED = (198, 70, 70)
+RED_DARK = (110, 40, 40)
+TEAL = (86, 178, 152)
+TEAL_DARK = (45, 100, 85)
+VIOLET = (140, 125, 214)
+VIOLET_DARK = (78, 68, 130)
+GREEN_FRIENDLY = (120, 200, 150)
+TEXT = (238, 235, 224)
+MUTED = (150, 155, 173)
+FLEE_FILL = (58, 62, 78)
+BLACK = (12, 13, 18)
+WHITE = (247, 247, 242)
+
+
+# ---------------------------------------------------------------- #
+# Icon drawing (no image files - everything is vector shapes)
+# ---------------------------------------------------------------- #
+def draw_skull(surf, center, size, color, outline=BLACK):
+    cx, cy = center
+    r = size * 0.40
+    pygame.draw.circle(surf, color, (int(cx), int(cy - size * 0.06)), int(r))
+    jaw = pygame.Rect(0, 0, int(r * 1.3), int(r * 0.9))
+    jaw.center = (int(cx), int(cy + r * 0.55))
+    pygame.draw.rect(surf, color, jaw, border_radius=int(r * 0.25))
+    pygame.draw.circle(surf, color, (int(cx), int(cy - size * 0.06)), int(r))
+    eye_r = max(2, int(r * 0.26))
+    pygame.draw.circle(surf, outline, (int(cx - r * 0.42), int(cy - size * 0.06)), eye_r)
+    pygame.draw.circle(surf, outline, (int(cx + r * 0.42), int(cy - size * 0.06)), eye_r)
+    nose = [(cx, cy + size * 0.02),
+            (cx - r * 0.12, cy + size * 0.18),
+            (cx + r * 0.12, cy + size * 0.18)]
+    pygame.draw.polygon(surf, outline, nose)
+    tooth_w = max(1, int(size * 0.02))
+    for i in (-1, 0, 1):
+        x = int(cx + i * r * 0.35)
+        pygame.draw.line(surf, outline, (x, int(cy + r * 0.35)), (x, int(cy + r * 0.78)), tooth_w)
+    pygame.draw.circle(surf, BLACK, (int(cx), int(cy - size * 0.06)), int(r), 2)
+    pygame.draw.rect(surf, BLACK, jaw, width=2, border_radius=int(r * 0.25))
+
+
+def draw_potion(surf, center, size, liquid, outline=BLACK):
+    cx, cy = center
+    w = size * 0.56
+    top = cy - size * 0.28
+    bottom = cy + size * 0.36
+    neck_w = w * 0.30
+    neck = pygame.Rect(0, 0, int(neck_w), int(size * 0.16))
+    neck.midbottom = (int(cx), int(top) + 2)
+    pygame.draw.rect(surf, liquid, neck)
+    pygame.draw.rect(surf, outline, neck, 2)
+    cap = pygame.Rect(0, 0, int(neck_w * 1.4), int(size * 0.09))
+    cap.midbottom = neck.midtop
+    pygame.draw.rect(surf, (150, 120, 90), cap, border_radius=2)
+    pygame.draw.rect(surf, outline, cap, width=2, border_radius=2)
+    body = [(cx - w / 2, top), (cx + w / 2, top), (cx, bottom)]
+    pygame.draw.polygon(surf, liquid, body)
+    pygame.draw.polygon(surf, outline, body, 2)
+    hi_x = cx - w * 0.16
+    pygame.draw.line(surf, WHITE, (int(hi_x), int(top + 6)), (int(cx - w * 0.02), int(bottom - 14)), 2)
+
+
+def draw_ball(surf, center, size, color, outline=BLACK):
+    cx, cy = center
+    r = int(size * 0.40)
+    pygame.draw.circle(surf, color, center, r)
+    pygame.draw.line(surf, outline, (cx - r, cy), (cx + r, cy), 3)
+    pygame.draw.circle(surf, outline, center, max(3, int(r * 0.30)))
+    pygame.draw.circle(surf, WHITE, center, max(2, int(r * 0.16)))
+    pygame.draw.circle(surf, outline, center, r, 2)
+
+
+def draw_star(surf, center, size, color, outline=BLACK, points=5):
+    cx, cy = center
+    outer = size * 0.5
+    inner = outer * 0.42
+    pts = []
+    for i in range(points * 2):
+        angle = math.pi / points * i - math.pi / 2
+        r = outer if i % 2 == 0 else inner
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    pygame.draw.polygon(surf, color, pts)
+    pygame.draw.polygon(surf, outline, pts, 2)
+
+
+def draw_save_icon(surf, center, size, color, outline=BLACK):
+    """Simple floppy-disk glyph."""
+    cx, cy = center
+    r = pygame.Rect(0, 0, size * 0.66, size * 0.66)
+    r.center = center
+    pygame.draw.rect(surf, color, r, border_radius=int(size * 0.06))
+    pygame.draw.rect(surf, outline, r, width=2, border_radius=int(size * 0.06))
+    label_r = pygame.Rect(0, 0, size * 0.34, size * 0.22)
+    label_r.center = (cx, cy - size * 0.1)
+    pygame.draw.rect(surf, WHITE, label_r)
+    slot_r = pygame.Rect(0, 0, size * 0.18, size * 0.05)
+    slot_r.center = (cx + size * 0.08, cy - size * 0.1)
+    pygame.draw.rect(surf, BLACK, slot_r)
+
+
+def draw_coin(surf, center, size, color=GOLD, outline=BLACK):
+    """Simple credits/coin glyph."""
+    cx, cy = center
+    r = max(3, int(size * 0.36))
+    pygame.draw.circle(surf, color, center, r)
+    pygame.draw.circle(surf, outline, center, r, 2)
+    pygame.draw.circle(surf, outline, center, max(2, int(r * 0.55)), 1)
+
+
+def draw_sword(surf, center, size, color=(214, 214, 224), outline=BLACK):
+    cx, cy = center
+    blade_h = size * 0.6
+    blade = pygame.Rect(0, 0, max(3, int(size * 0.13)), int(blade_h))
+    blade.center = (cx, cy - size * 0.08)
+    pygame.draw.rect(surf, color, blade, border_radius=2)
+    pygame.draw.rect(surf, outline, blade, width=2, border_radius=2)
+    guard = pygame.Rect(0, 0, int(size * 0.36), int(size * 0.09))
+    guard.center = (cx, cy + blade_h * 0.32)
+    pygame.draw.rect(surf, GOLD, guard, border_radius=2)
+    pygame.draw.rect(surf, outline, guard, width=2, border_radius=2)
+    handle = pygame.Rect(0, 0, int(size * 0.11), int(size * 0.24))
+    handle.midtop = guard.midbottom
+    pygame.draw.rect(surf, (120, 82, 48), handle, border_radius=3)
+    pygame.draw.rect(surf, outline, handle, width=2, border_radius=3)
+
+
+def draw_shield(surf, center, size, color=TEAL, outline=BLACK):
+    cx, cy = center
+    w, h = size * 0.58, size * 0.68
+    pts = [
+        (cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
+        (cx + w / 2, cy + h * 0.1), (cx, cy + h / 2),
+        (cx - w / 2, cy + h * 0.1),
+    ]
+    pygame.draw.polygon(surf, color, pts)
+    pygame.draw.polygon(surf, outline, pts, 2)
+    pygame.draw.line(surf, outline, (cx, cy - h / 2 + 5), (cx, cy + h * 0.28), 2)
+
+
+def draw_hp_bar(surf, rect, current, maximum, low_color=RED, high_color=GREEN_FRIENDLY):
+    """Reusable HP bar - used for both the player and monsters."""
+    pygame.draw.rect(surf, PANEL_BORDER, rect, border_radius=8)
+    pct = max(0.0, min(1.0, current / maximum)) if maximum else 0.0
+    fill_rect = pygame.Rect(rect.x, rect.y, int(rect.width * pct), rect.height)
+    color = high_color if pct > 0.4 else low_color
+    if fill_rect.width > 0:
+        pygame.draw.rect(surf, color, fill_rect, border_radius=8)
+    pygame.draw.rect(surf, PANEL_BORDER_LIT, rect, width=2, border_radius=8)
+
+
+# ---------------------------------------------------------------- #
+# Card generation (hp_range/cl_range let modes scale difficulty)
+# ---------------------------------------------------------------- #
+def gen_monster(hp_range=(4, 18), cl_range=(1, 10)):
+    hp = random.randint(*hp_range)
+    xp_value = max(1, round(1 + (hp - 4) / 2.8))
+    capture_level = random.randint(*cl_range)
+    name = random.choice(MONSTER_NAMES)
+    return {"type": "monster", "name": name, "hp": hp, "max_hp": hp,
+            "capture_level": capture_level, "xp_value": xp_value}
+
+
+def gen_potion():
+    return {"type": "potion", "heal": random.randint(3, 8)}
+
+
+def gen_ball():
+    return {"type": "ball", "boost": random.randint(1, 3)}
+
+
+def deal_cards(hp_range=(4, 18), cl_range=(1, 10)):
+    num_monsters = random.choice([1, 2])
+    has_potion = 1 if random.random() < (1 / 3) else 0
+    num_balls = 4 - num_monsters - has_potion
+    cards = [gen_monster(hp_range, cl_range) for _ in range(num_monsters)]
+    if has_potion:
+        cards.append(gen_potion())
+    cards += [gen_ball() for _ in range(num_balls)]
+    random.shuffle(cards)
+    for c in cards:
+        c["resolved"] = False
+    return cards
+
+
+# ---------------------------------------------------------------- #
+# Save file helpers
+# ---------------------------------------------------------------- #
+def save_exists():
+    return os.path.isfile(SAVE_PATH)
+
+
+def write_save(data):
+    try:
+        with open(SAVE_PATH, "w") as f:
+            json.dump(data, f)
+        return True
+    except OSError:
+        return False
+
+
+def read_save():
+    try:
+        with open(SAVE_PATH, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def delete_save():
+    try:
+        if os.path.isfile(SAVE_PATH):
+            os.remove(SAVE_PATH)
+    except OSError:
+        pass
+
+
+def save_summary(data):
+    mode = data.get("mode")
+    if mode == "classic":
+        diff = DIFFICULTIES.get(data.get("difficulty"), {}).get("label", "?")
+        cap = DIFFICULTIES.get(data.get("difficulty"), {}).get("rounds", "?")
+        return f"Classic ({diff}) - Round {data.get('round_num', 1)}/{cap} - XP {data.get('xp', 0)}"
+    if mode == "quest":
+        qi = data.get("quest_index", 0)
+        return f"Quest {qi + 1}/{len(QUESTS)} - XP {data.get('xp', 0)}"
+    if mode == "hardcore":
+        return f"Hardcore - Round {data.get('round_num', 1)} - XP {data.get('xp', 0)}"
+    return "Unknown run"
+
+
+# ---------------------------------------------------------------- #
+# UI helpers
+# ---------------------------------------------------------------- #
+class Button:
+    def __init__(self, rect, on_tap):
+        self.rect = pygame.Rect(rect)
+        self.on_tap = on_tap
+
+    def hit(self, pos):
+        return self.rect.collidepoint(pos)
+
+
+def panel(surf, rect, border=PANEL_BORDER, fill=PANEL, radius=16, width=3):
+    pygame.draw.rect(surf, fill, rect, border_radius=radius)
+    pygame.draw.rect(surf, border, rect, width=width, border_radius=radius)
+
+
+def wrap_text(text, font, max_width):
+    words = text.split(" ")
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if font.size(trial)[0] <= max_width:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+# ---------------------------------------------------------------- #
+# Game state / logic
+# ---------------------------------------------------------------- #
+class Game:
+    def __init__(self):
+        self.mode = None            # None = top-level mode select
+                                     # "classic_select" = difficulty submenu
+                                     # "classic" / "quest" / "hardcore" = playing
+        self.difficulty = None      # classic mode only: "easy"/"normal"/"hard"
+        self._reset_common()
+        self.cards = []
+        self.last_msg = ("Choose a mode to begin!", GOLD)
+        self.pending_monster = None
+        self.game_over_msg = None
+        self.victory_msg = None
+        self.show_bench = False
+        self.confirm_quit = False
+        self.quest_complete = False
+        self.next_quest_title = None
+        self.quest_index = 0
+        self.quest_progress = {}
+        self.show_shop = False
+        self.show_help = False
+
+    def _reset_common(self):
+        self.xp = 0
+        self.capture_level = STARTING_CAPTURE_LEVEL
+        self.roster = []
+        self.active_index = None
+        self.round_num = 1
+        self.no_monster_rounds = 0
+        self.credits = STARTING_CREDITS
+        self.capture_balls = STARTING_CAPTURE_BALLS
+        self.potions = 0
+        self.has_sword = False
+        self.has_shield = False
+        self.player_hp = STARTING_PLAYER_HP
+        self.player_max_hp = STARTING_PLAYER_HP
+
+    # ---------- mode management ----------
+    def go_to_classic_select(self):
+        self.mode = "classic_select"
+
+    def back_to_top(self):
+        self.mode = None
+        self.say("Choose a mode to begin!", GOLD)
+
+    def start_mode(self, mode, difficulty=None):
+        self.mode = mode
+        self.difficulty = difficulty
+        self._reset_common()
+        self.game_over_msg = None
+        self.victory_msg = None
+        self.pending_monster = None
+        self.show_bench = False
+        self.confirm_quit = False
+        self.quest_complete = False
+        self.show_shop = False
+        self.show_help = False
+        if mode == "quest":
+            self.quest_index = 0
+            self._init_quest_progress()
+            self.say(f"{self.current_quest()['title']} - go catch your targets!", GOLD)
+        elif mode == "classic":
+            d = DIFFICULTIES[difficulty]
+            self.say(f"Classic ({d['label']}) - survive {d['rounds']} rounds. Round 1 is catchable!", GOLD)
+        else:  # hardcore
+            self.say("Hardcore Mode - hard monsters, endless rounds. Round 1 is catchable!", GOLD)
+        self.cards = deal_cards(*self.current_ranges())
+
+    def change_mode(self):
+        self.mode = None
+        self.say("Choose a mode to begin!", GOLD)
+
+    def play_again(self):
+        self.start_mode(self.mode, self.difficulty)
+
+    def current_quest(self):
+        return QUESTS[self.quest_index]
+
+    def _init_quest_progress(self):
+        self.quest_progress = {name: 0 for name in self.current_quest()["targets"]}
+
+    def current_ranges(self):
+        if self.mode == "quest":
+            q = self.current_quest()
+            return q["hp"], q["cl"]
+        if self.mode == "classic":
+            d = DIFFICULTIES[self.difficulty]
+            return d["hp"], d["cl"]
+        if self.mode == "hardcore":
+            d = DIFFICULTIES["hard"]
+            return d["hp"], d["cl"]
+        return (4, 18), (1, 10)
+
+    def mode_label(self):
+        if self.mode == "classic":
+            return f"Classic ({DIFFICULTIES[self.difficulty]['label']})"
+        if self.mode == "quest":
+            return "Quest"
+        if self.mode == "hardcore":
+            return "Hardcore"
+        return ""
+
+    @property
+    def active(self):
+        if self.active_index is None or self.active_index >= len(self.roster):
+            return None
+        return self.roster[self.active_index]
+
+    @property
+    def bench(self):
+        return [(i, m) for i, m in enumerate(self.roster) if i != self.active_index]
+
+    def cards_remaining(self):
+        return sum(1 for c in self.cards if not c.get("resolved"))
+
+    def say(self, msg, color=TEXT):
+        self.last_msg = (msg, color)
+
+    def catchable(self, card):
+        if self.capture_balls <= 0:
+            return False
+        return self.round_num == 1 or self.capture_level > card["capture_level"]
+
+    # ---------- save / load ----------
+    def to_dict(self):
+        return {
+            "mode": self.mode,
+            "difficulty": self.difficulty,
+            "xp": self.xp,
+            "capture_level": self.capture_level,
+            "roster": self.roster,
+            "active_index": self.active_index,
+            "round_num": self.round_num,
+            "no_monster_rounds": self.no_monster_rounds,
+            "quest_index": self.quest_index,
+            "quest_progress": self.quest_progress,
+            "cards": self.cards,
+            "credits": self.credits,
+            "capture_balls": self.capture_balls,
+            "potions": self.potions,
+            "has_sword": self.has_sword,
+            "has_shield": self.has_shield,
+            "player_hp": self.player_hp,
+            "player_max_hp": self.player_max_hp,
+        }
+
+    def save(self):
+        if self.mode not in ("classic", "quest", "hardcore"):
+            return
+        ok = write_save(self.to_dict())
+        self.say("Game saved!" if ok else "Save failed - couldn't write file.", GOLD if ok else RED)
+
+    def load_from(self, data):
+        self.mode = data.get("mode")
+        self.difficulty = data.get("difficulty")
+        self.xp = data.get("xp", 0)
+        self.capture_level = data.get("capture_level", STARTING_CAPTURE_LEVEL)
+        self.roster = data.get("roster", [])
+        self.active_index = data.get("active_index")
+        self.round_num = data.get("round_num", 1)
+        self.no_monster_rounds = data.get("no_monster_rounds", 0)
+        self.quest_index = data.get("quest_index", 0)
+        self.quest_progress = data.get("quest_progress", {})
+        self.cards = data.get("cards") or deal_cards(*self.current_ranges())
+        for c in self.cards:
+            c.setdefault("resolved", False)
+        # New-in-this-version fields fall back to sensible defaults so
+        # saves from before the shop/HP/equipment update still load.
+        self.credits = data.get("credits", STARTING_CREDITS)
+        self.capture_balls = data.get("capture_balls", STARTING_CAPTURE_BALLS)
+        self.potions = data.get("potions", 0)
+        self.has_sword = data.get("has_sword", False)
+        self.has_shield = data.get("has_shield", False)
+        self.player_max_hp = data.get("player_max_hp", STARTING_PLAYER_HP)
+        self.player_hp = data.get("player_hp", self.player_max_hp)
+        self.pending_monster = None
+        self.game_over_msg = None
+        self.victory_msg = None
+        self.show_bench = False
+        self.confirm_quit = False
+        self.quest_complete = False
+        self.show_shop = False
+        self.say(f"Welcome back! Continuing your {self.mode_label()} run.", GOLD)
+
+    def continue_from_save(self):
+        data = read_save()
+        if data is None:
+            self.say("No save file found.", RED)
+            return
+        self.load_from(data)
+
+    # ---------- quit confirmation ----------
+    def open_quit_confirm(self):
+        self.confirm_quit = True
+
+    def close_quit_confirm(self):
+        self.confirm_quit = False
+
+    # ---------- actions ----------
+    def switch_active(self, idx):
+        if 0 <= idx < len(self.roster):
+            self.active_index = idx
+            self.say(f"{self.roster[idx]['name']} is now active.", TEAL)
+        self.show_bench = False
+
+    def catch_monster(self, card):
+        if self.capture_balls <= 0:
+            self.say("No Capture Balls left - can't catch anything!", RED)
+            return
+        self.capture_balls -= 1
+        self.credits += CREDIT_PER_CATCH
+        mon = {"type": "monster", "name": card["name"], "hp": card["hp"],
+               "max_hp": card["hp"], "capture_level": card["capture_level"],
+               "xp_value": card["xp_value"]}
+        self.roster.append(mon)
+        if self.active_index is None:
+            self.active_index = len(self.roster) - 1
+            self.say(f"Caught {mon['name']}! It's now active. (+{CREDIT_PER_CATCH} credits)", TEAL)
+        else:
+            self.say(f"Caught {mon['name']}! Added to bench. (+{CREDIT_PER_CATCH} credits)", TEAL)
+        self._register_quest_catch(card["name"])
+
+    def battle_monster(self, card):
+        active = self.active
+        if active["hp"] > card["hp"]:
+            active["hp"] -= card["hp"]
+            self.xp += card["xp_value"]
+            self.credits += CREDIT_PER_BATTLE_WIN
+            self.say(f"{active['name']} defeats {card['name']}! "
+                     f"+{card['xp_value']} XP, +{CREDIT_PER_BATTLE_WIN} credits", TEAL)
+            self._apply_hard_battle_damage()
+        else:
+            self.say(f"{active['name']} was defeated by {card['name']}!", RED)
+            del self.roster[self.active_index]
+            self.active_index = None
+            if self.roster:
+                self.active_index = 0
+                self.say(f"{self.roster[0]['name']} steps up as active.", GOLD)
+                self._apply_hard_battle_damage()
+            else:
+                self.game_over_msg = f"YOU DIED - final XP: {self.xp}"
+                delete_save()
+
+    def sword_fight(self, card):
+        """Fight a monster yourself using the sword - no active monster
+        needed. Costs player HP based on the monster's toughness."""
+        if not self.has_sword:
+            return
+        dmg = max(1, round(card["hp"] * SWORD_DAMAGE_FRACTION))
+        if self.has_shield:
+            dmg = max(1, round(dmg * (1 - SHIELD_DAMAGE_REDUCTION)))
+        if self.player_hp > dmg:
+            self.player_hp -= dmg
+            self.xp += card["xp_value"]
+            self.credits += CREDIT_PER_BATTLE_WIN
+            self.say(f"You strike down {card['name']} with your sword! "
+                     f"-{dmg} HP, +{card['xp_value']} XP", TEAL)
+            self._apply_hard_battle_damage()
+        else:
+            self.player_hp = 0
+            self.game_over_msg = f"Overwhelmed by {card['name']} - final XP: {self.xp}"
+            delete_save()
+
+    def resolve_potion(self, card):
+        active = self.active
+        if not active:
+            self.say("No active monster to heal - potion wasted.", RED)
+            return
+        before = active["hp"]
+        active["hp"] = min(active["max_hp"], active["hp"] + card["heal"])
+        self.say(f"{active['name']} heals {active['hp'] - before} HP.", TEAL)
+
+    def resolve_ball(self, card):
+        self.capture_level += card["boost"]
+        self.capture_balls += 1
+        self.say(f"Capture Level +{card['boost']}! Found a Capture Ball "
+                 f"(now {self.capture_balls}).", VIOLET)
+
+    def use_potion(self):
+        active = self.active
+        if self.potions <= 0 or not active:
+            return
+        if active["hp"] >= active["max_hp"]:
+            self.say(f"{active['name']} is already at full HP.", MUTED)
+            return
+        self.potions -= 1
+        before = active["hp"]
+        active["hp"] = min(active["max_hp"], active["hp"] + 8)
+        self.say(f"Used a Potion - {active['name']} heals {active['hp'] - before} HP.", TEAL)
+
+    def _apply_hard_battle_damage(self):
+        """Hard classic and Hardcore drain a little player HP after
+        every battle/fight, win or lose."""
+        if self.game_over_msg or self.victory_msg:
+            return
+        is_hard = self.mode == "hardcore" or (self.mode == "classic" and self.difficulty == "hard")
+        if not is_hard:
+            return
+        dmg = random.randint(*HARD_BATTLE_DAMAGE)
+        if self.has_shield:
+            dmg = max(1, round(dmg * (1 - SHIELD_DAMAGE_REDUCTION)))
+        self.player_hp = max(0, self.player_hp - dmg)
+        if self.player_hp <= 0:
+            self.game_over_msg = f"Your wounds caught up with you - final XP: {self.xp}"
+            delete_save()
+
+    # ---------- shop ----------
+    def open_shop(self):
+        self.show_shop = True
+
+    def close_shop(self):
+        self.show_shop = False
+
+    # ---------- help ----------
+    def open_help(self):
+        self.show_help = True
+
+    def close_help(self):
+        self.show_help = False
+
+    def buy_item(self, key):
+        item = next((it for it in SHOP_ITEMS if it["key"] == key), None)
+        if item is None:
+            return
+        if key == "sword" and self.has_sword:
+            self.say("You already own the Sword.", MUTED)
+            return
+        if key == "shield" and self.has_shield:
+            self.say("You already own the Shield.", MUTED)
+            return
+        if self.credits < item["cost"]:
+            self.say("Not enough credits!", RED)
+            return
+        self.credits -= item["cost"]
+        if key == "ball":
+            self.capture_balls += 1
+            self.say("Bought a Capture Ball!", VIOLET)
+        elif key == "potion":
+            self.potions += 1
+            self.say("Bought a Potion!", TEAL)
+        elif key == "sword":
+            self.has_sword = True
+            self.say("Bought the Sword! Fight monsters even with no active monster.", GOLD)
+        elif key == "shield":
+            self.has_shield = True
+            self.say("Bought the Shield! Battle damage halved.", GOLD)
+
+    # ---------- quest progression ----------
+    def _register_quest_catch(self, name):
+        if self.mode != "quest" or self.quest_complete or self.victory_msg:
+            return
+        targets = self.current_quest()["targets"]
+        if name in self.quest_progress and self.quest_progress[name] < targets[name]:
+            self.quest_progress[name] += 1
+        if all(self.quest_progress[n] >= c for n, c in targets.items()):
+            self._complete_quest()
+
+    def _complete_quest(self):
+        title = self.current_quest()["title"]
+        if self.quest_index + 1 >= len(QUESTS):
+            self.victory_msg = f"All quests complete! Final XP: {self.xp}"
+            delete_save()
+        else:
+            self.quest_index += 1
+            self._init_quest_progress()
+            self.next_quest_title = self.current_quest()["title"]
+            self.quest_complete = True
+            self.say(f"{title} complete!", GOLD)
+
+    def continue_after_quest(self):
+        self.quest_complete = False
+        self.round_num += 1
+        self.cards = deal_cards(*self.current_ranges())
+        self.say(f"{self.next_quest_title} - go catch your targets!", GOLD)
+
+    # ---------- turn flow: tap through all 4 cards, then auto-redeal ----------
+    def tap_card(self, card):
+        if (self.game_over_msg or self.victory_msg or self.pending_monster
+                or self.show_bench or self.confirm_quit or self.quest_complete
+                or self.show_shop or self.show_help):
+            return
+        if card.get("resolved"):
+            return
+        if card["type"] == "monster":
+            self.pending_monster = card
+            return  # resolved via resolve_pending once the player picks an action
+        elif card["type"] == "potion":
+            self.resolve_potion(card)
+        elif card["type"] == "ball":
+            self.resolve_ball(card)
+        card["resolved"] = True
+        self._finish_card_if_round_done()
+
+    def resolve_pending(self, choice):
+        card = self.pending_monster
+        if card is None:
+            # Defensive: a duplicate/phantom tap landed here after the
+            # popup already closed. Ignore it instead of crashing.
+            return
+        self.pending_monster = None
+        if choice == "catch":
+            self.catch_monster(card)
+        elif choice == "battle":
+            self.battle_monster(card)
+        elif choice == "fight":
+            self.sword_fight(card)
+        elif choice == "flee":
+            self.say(f"You flee from {card['name']}.", MUTED)
+        card["resolved"] = True
+        self._finish_card_if_round_done()
+
+    def _finish_card_if_round_done(self):
+        if self.game_over_msg or self.victory_msg or self.quest_complete:
+            return
+        if self.cards_remaining() == 0:
+            self._advance_round()
+
+    def _advance_round(self):
+        self.round_num += 1
+        if self.mode == "classic":
+            cap = DIFFICULTIES[self.difficulty]["rounds"]
+            if self.round_num > cap:
+                label = DIFFICULTIES[self.difficulty]["label"]
+                self.victory_msg = f"You survived all {cap} rounds ({label})! Final XP: {self.xp}"
+                delete_save()
+                return
+        if self.active is None:
+            self.no_monster_rounds += 1
+            if self.no_monster_rounds >= 2:
+                self.game_over_msg = (f"No monster for {self.no_monster_rounds} rounds - "
+                                        f"you lose! Final XP: {self.xp}")
+                delete_save()
+                return
+        else:
+            self.no_monster_rounds = 0
+        self.cards = deal_cards(*self.current_ranges())
+
+
+# ---------------------------------------------------------------- #
+# Rendering / App
+# ---------------------------------------------------------------- #
+class App:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("Monster Tamer")
+        self.screen = pygame.display.set_mode((START_WIDTH, START_HEIGHT), pygame.RESIZABLE)
+        self.clock = pygame.time.Clock()
+        self.game = Game()
+        self.buttons = []
+        self._build_fonts()
+
+    def _build_fonts(self):
+        w, h = self.screen.get_size()
+        scale = min(w / START_WIDTH, h / START_HEIGHT)
+        fam = "couriernew,dejavusansmono,monospace"
+        self.font_xl = pygame.font.SysFont(fam, max(16, int(34 * scale)), bold=True)
+        self.font_big = pygame.font.SysFont(fam, max(14, int(26 * scale)), bold=True)
+        self.font_mid = pygame.font.SysFont(fam, max(12, int(21 * scale)), bold=True)
+        self.font_sm = pygame.font.SysFont(fam, max(11, int(17 * scale)))
+        self.font_tiny = pygame.font.SysFont(fam, max(10, int(14 * scale)))
+
+    def size(self):
+        return self.screen.get_size()
+
+    def layout(self):
+        w, h = self.size()
+        margin = int(h * 0.02)
+        status_h = int(h * 0.11)
+        toast_h = int(h * 0.08)
+        active_h = int(h * 0.13)
+        quest_h = int(h * 0.10) if self.game.mode == "quest" else 0
+
+        status = pygame.Rect(margin, margin, w - 2 * margin, status_h)
+        toast = pygame.Rect(margin, status.bottom + margin // 2, w - 2 * margin, toast_h)
+        active_bar = pygame.Rect(margin, toast.bottom + margin // 2, w - 2 * margin, active_h)
+        if quest_h:
+            quest_bar = pygame.Rect(margin, active_bar.bottom + margin // 2, w - 2 * margin, quest_h)
+            cards_top = quest_bar.bottom + margin
+        else:
+            quest_bar = None
+            cards_top = active_bar.bottom + margin
+        cards = pygame.Rect(margin, cards_top, w - 2 * margin, h - cards_top - margin)
+        return status, toast, active_bar, quest_bar, cards
+
+    def card_rects(self, area, n):
+        cols = 2
+        rows = (n + 1) // 2
+        gap = int(area.width * 0.025)
+        cw = (area.width - gap * (cols - 1)) // cols
+        ch = (area.height - gap * (rows - 1)) // rows
+        rects = []
+        for i in range(n):
+            r, c = divmod(i, cols)
+            x = area.x + c * (cw + gap)
+            y = area.y + r * (ch + gap)
+            rects.append(pygame.Rect(x, y, cw, ch))
+        return rects
+
+    def _draw_top_quit_button(self, w, h):
+        side = min(56, int(h * 0.09))
+        qrect = pygame.Rect(0, 0, side, side)
+        qrect.topright = (w - int(w * 0.03), int(h * 0.03))
+        pygame.draw.rect(self.screen, RED_DARK, qrect, border_radius=12)
+        pygame.draw.rect(self.screen, RED, qrect, width=3, border_radius=12)
+        xt = self.font_big.render("X", True, WHITE)
+        self.screen.blit(xt, xt.get_rect(center=qrect.center))
+        self.buttons.append(Button(qrect, self.game.open_quit_confirm))
+
+    def _draw_top_help_button(self, w, h):
+        side = min(56, int(h * 0.09))
+        hrect = pygame.Rect(0, 0, side, side)
+        hrect.topright = (w - int(w * 0.03) - side - 12, int(h * 0.03))
+        pygame.draw.rect(self.screen, VIOLET_DARK, hrect, border_radius=12)
+        pygame.draw.rect(self.screen, VIOLET, hrect, width=3, border_radius=12)
+        qt = self.font_big.render("?", True, WHITE)
+        self.screen.blit(qt, qt.get_rect(center=hrect.center))
+        self.buttons.append(Button(hrect, self.game.open_help))
+
+    # ---------- top-level mode select ----------
+    def draw_mode_select(self):
+        w, h = self.size()
+        title = self.font_xl.render("MONSTER TAMER", True, GOLD)
+        self.screen.blit(title, title.get_rect(center=(w // 2, int(h * 0.09))))
+        sub = self.font_sm.render("Choose a mode to begin", True, MUTED)
+        self.screen.blit(sub, sub.get_rect(center=(w // 2, int(h * 0.155))))
+        self._draw_top_quit_button(w, h)
+        self._draw_top_help_button(w, h)
+
+        modes = [
+            ("classic_select", "CLASSIC", "Easy, Normal, or Hard - survive a fixed run.", TEAL, TEAL_DARK),
+            ("quest", "QUEST", "Catch a checklist of monsters. Each stage gets harder.", GOLD, GOLD_DARK),
+            ("hardcore", "HARDCORE", "Hard monsters, no round limit. Play until you die.", RED, RED_DARK),
+        ]
+
+        has_save = save_exists()
+        top = int(h * 0.23)
+        margin = int(w * 0.1)
+        gap = int(h * 0.03)
+        n_rows = len(modes) + (1 if has_save else 0)
+        card_h = int((h * 0.94 - top) / n_rows - gap)
+
+        row = 0
+        if has_save:
+            data = read_save()
+            rect = pygame.Rect(margin, top, w - 2 * margin, card_h)
+            pygame.draw.rect(self.screen, GOLD_DARK, rect, border_radius=16)
+            pygame.draw.rect(self.screen, GOLD, rect, width=3, border_radius=16)
+            lbl = self.font_big.render("CONTINUE", True, WHITE)
+            self.screen.blit(lbl, (rect.x + 24, rect.y + rect.height * 0.2))
+            if data:
+                dtxt = self.font_sm.render(save_summary(data), True, TEXT)
+                self.screen.blit(dtxt, (rect.x + 24, rect.y + rect.height * 0.58))
+            self.buttons.append(Button(rect, self.game.continue_from_save))
+            row = 1
+
+        for i, (mode_id, label, desc, color, dark) in enumerate(modes):
+            rect = pygame.Rect(margin, top + (row + i) * (card_h + gap), w - 2 * margin, card_h)
+            pygame.draw.rect(self.screen, dark, rect, border_radius=16)
+            pygame.draw.rect(self.screen, color, rect, width=3, border_radius=16)
+            lbl = self.font_big.render(label, True, WHITE)
+            self.screen.blit(lbl, (rect.x + 24, rect.y + rect.height * 0.2))
+            for j, line in enumerate(wrap_text(desc, self.font_sm, rect.width - 48)):
+                dtxt = self.font_sm.render(line, True, TEXT)
+                self.screen.blit(dtxt, (rect.x + 24, rect.y + rect.height * 0.58 + j * 22))
+            if mode_id == "classic_select":
+                action = self.game.go_to_classic_select
+            else:
+                action = (lambda m=mode_id: self.game.start_mode(m))
+            self.buttons.append(Button(rect, action))
+
+    # ---------- classic difficulty submenu ----------
+    def draw_classic_select(self):
+        w, h = self.size()
+        title = self.font_xl.render("CLASSIC MODE", True, TEAL)
+        self.screen.blit(title, title.get_rect(center=(w // 2, int(h * 0.09))))
+        sub = self.font_sm.render("Choose a difficulty", True, MUTED)
+        self.screen.blit(sub, sub.get_rect(center=(w // 2, int(h * 0.155))))
+        self._draw_top_quit_button(w, h)
+        self._draw_top_help_button(w, h)
+
+        back = pygame.Rect(0, 0, int(w * 0.18), min(56, int(h * 0.09)))
+        back.topleft = (int(w * 0.03), int(h * 0.03))
+        pygame.draw.rect(self.screen, PANEL, back, border_radius=12)
+        pygame.draw.rect(self.screen, PANEL_BORDER_LIT, back, width=3, border_radius=12)
+        bt = self.font_mid.render("< BACK", True, TEXT)
+        self.screen.blit(bt, bt.get_rect(center=back.center))
+        self.buttons.append(Button(back, self.game.back_to_top))
+
+        colors = {
+            "easy": (GREEN_FRIENDLY, TEAL_DARK),
+            "normal": (GOLD, GOLD_DARK),
+            "hard": (RED, RED_DARK),
+        }
+        top = int(h * 0.23)
+        margin = int(w * 0.1)
+        gap = int(h * 0.03)
+        card_h = int((h * 0.94 - top) / 3 - gap)
+        for i, key in enumerate(("easy", "normal", "hard")):
+            d = DIFFICULTIES[key]
+            color, dark = colors[key]
+            rect = pygame.Rect(margin, top + i * (card_h + gap), w - 2 * margin, card_h)
+            pygame.draw.rect(self.screen, dark, rect, border_radius=16)
+            pygame.draw.rect(self.screen, color, rect, width=3, border_radius=16)
+            lbl = self.font_big.render(f"{d['label'].upper()}  -  {d['rounds']} ROUNDS", True, WHITE)
+            self.screen.blit(lbl, (rect.x + 24, rect.y + rect.height * 0.28))
+            desc = f"Monster HP {d['hp'][0]}-{d['hp'][1]}, Capture Lv {d['cl'][0]}-{d['cl'][1]}"
+            dtxt = self.font_sm.render(desc, True, TEXT)
+            self.screen.blit(dtxt, (rect.x + 24, rect.y + rect.height * 0.62))
+            self.buttons.append(Button(rect, (lambda k=key: self.game.start_mode("classic", k))))
+
+    # ---------- draw pieces (gameplay) ----------
+    def draw_status_bar(self, rect):
+        g = self.game
+        panel(self.screen, rect, radius=14)
+        pad = int(rect.height * 0.2)
+        y = rect.centery
+        x = rect.x + pad
+        hp_color = TEAL if g.player_hp > g.player_max_hp * 0.3 else RED
+        for label, value, color in (
+            ("XP", g.xp, GOLD),
+            ("LV", g.capture_level, VIOLET),
+            ("HP", f"{g.player_hp}/{g.player_max_hp}", hp_color),
+        ):
+            txt = self.font_mid.render(f"{label} {value}", True, color)
+            self.screen.blit(txt, (x, y - txt.get_height() // 2))
+            x += txt.get_width() + pad * 1.2
+
+        coin_r = int(rect.height * 0.16)
+        draw_coin(self.screen, (x + coin_r, y), coin_r * 2, GOLD)
+        credit_txt = self.font_mid.render(f"{g.credits}", True, GOLD)
+        self.screen.blit(credit_txt, (x + coin_r * 2 + 6, y - credit_txt.get_height() // 2))
+
+        if g.mode == "classic":
+            cap = DIFFICULTIES[g.difficulty]["rounds"]
+            rnd_text = f"Round {g.round_num}/{cap}  -  {g.cards_remaining()} left"
+        elif g.mode == "quest":
+            rnd_text = f"Quest {g.quest_index + 1}/{len(QUESTS)}  -  Round {g.round_num}  -  {g.cards_remaining()} left"
+        else:
+            rnd_text = f"Round {g.round_num}  -  {g.cards_remaining()} card(s) left"
+        rnd = self.font_sm.render(rnd_text, True, MUTED)
+
+        side = rect.height - 12
+        qrect = pygame.Rect(0, 0, side, side)
+        qrect.midright = (rect.right - 10, rect.centery)
+        pygame.draw.rect(self.screen, RED_DARK, qrect, border_radius=12)
+        pygame.draw.rect(self.screen, RED, qrect, width=3, border_radius=12)
+        xt = self.font_big.render("X", True, WHITE)
+        self.screen.blit(xt, xt.get_rect(center=qrect.center))
+        self.buttons.append(Button(qrect, self.game.open_quit_confirm))
+
+        save_w = int(side * 2.0)
+        srect = pygame.Rect(0, 0, save_w, side)
+        srect.midright = (qrect.left - 14, rect.centery)
+        pygame.draw.rect(self.screen, TEAL_DARK, srect, border_radius=12)
+        pygame.draw.rect(self.screen, TEAL, srect, width=3, border_radius=12)
+        draw_save_icon(self.screen, (srect.x + srect.height * 0.55, srect.centery), srect.height * 0.85, WHITE)
+        stxt = self.font_tiny.render("SAVE", True, WHITE)
+        self.screen.blit(stxt, (srect.x + srect.height * 0.95, srect.centery - stxt.get_height() // 2))
+        self.buttons.append(Button(srect, self.game.save))
+
+        shop_w = int(side * 2.0)
+        shoprect = pygame.Rect(0, 0, shop_w, side)
+        shoprect.midright = (srect.left - 14, rect.centery)
+        pygame.draw.rect(self.screen, GOLD_DARK, shoprect, border_radius=12)
+        pygame.draw.rect(self.screen, GOLD, shoprect, width=3, border_radius=12)
+        draw_coin(self.screen, (shoprect.x + shoprect.height * 0.5, shoprect.centery), shoprect.height * 0.75, WHITE)
+        shtxt = self.font_tiny.render("SHOP", True, WHITE)
+        self.screen.blit(shtxt, (shoprect.x + shoprect.height * 0.9, shoprect.centery - shtxt.get_height() // 2))
+        self.buttons.append(Button(shoprect, self.game.open_shop))
+
+        helprect = pygame.Rect(0, 0, side, side)
+        helprect.midright = (shoprect.left - 14, rect.centery)
+        pygame.draw.rect(self.screen, VIOLET_DARK, helprect, border_radius=12)
+        pygame.draw.rect(self.screen, VIOLET, helprect, width=3, border_radius=12)
+        qt = self.font_big.render("?", True, WHITE)
+        self.screen.blit(qt, qt.get_rect(center=helprect.center))
+        self.buttons.append(Button(helprect, self.game.open_help))
+
+        self.screen.blit(rnd, (helprect.left - rnd.get_width() - 16, y - rnd.get_height() // 2))
+
+    def draw_toast(self, rect):
+        msg, color = self.game.last_msg
+        panel(self.screen, rect, radius=12, fill=(24, 27, 40), border=PANEL_BORDER)
+        lines = wrap_text(msg, self.font_mid, rect.width - 30)[:1]
+        if lines:
+            t = self.font_mid.render(lines[0], True, color)
+            self.screen.blit(t, t.get_rect(midleft=(rect.x + 16, rect.centery)))
+
+    def draw_quest_bar(self, rect):
+        g = self.game
+        panel(self.screen, rect, radius=12, fill=(34, 30, 20), border=GOLD_DARK)
+        q = g.current_quest()
+        title = self.font_sm.render(q["title"], True, GOLD)
+        self.screen.blit(title, (rect.x + 14, rect.y + rect.height * 0.12))
+        parts = [f"{name} {g.quest_progress.get(name, 0)}/{need}" for name, need in q["targets"].items()]
+        prog = self.font_tiny.render("   ".join(parts), True, TEXT)
+        self.screen.blit(prog, (rect.x + 14, rect.y + rect.height * 0.55))
+
+    def draw_active_bar(self, rect):
+        g = self.game
+        panel(self.screen, rect, radius=14)
+        active = g.active
+        icon_r = rect.height * 0.9
+        icon_c = (rect.x + rect.height * 0.55, rect.centery)
+
+        if active:
+            draw_skull(self.screen, icon_c, icon_r, GREEN_FRIENDLY)
+            tx = rect.x + rect.height + 16
+            name = self.font_big.render(active["name"], True, TEXT)
+            self.screen.blit(name, (tx, rect.y + rect.height * 0.14))
+            bar_w = int(rect.width * 0.32)
+            bar_rect = pygame.Rect(tx, rect.y + rect.height * 0.6, bar_w, int(rect.height * 0.22))
+            draw_hp_bar(self.screen, bar_rect, active["hp"], active["max_hp"])
+            hp_txt = self.font_sm.render(f"{active['hp']}/{active['max_hp']} HP", True, MUTED)
+            self.screen.blit(hp_txt, (bar_rect.right + 12, bar_rect.centery - hp_txt.get_height() // 2))
+        else:
+            draw_skull(self.screen, icon_c, icon_r, MUTED)
+            tx = rect.x + rect.height + 16
+            none_txt = self.font_big.render("No active monster", True, MUTED)
+            self.screen.blit(none_txt, (tx, rect.y + rect.height * 0.14))
+            if g.no_monster_rounds > 0:
+                warn = self.font_sm.render(
+                    f"{g.no_monster_rounds} round(s) with none - lose at 2!", True, RED)
+                self.screen.blit(warn, (tx, rect.y + rect.height * 0.55))
+
+        right_edge = rect.right - 16
+        if g.bench:
+            bw, bh = int(rect.height * 1.7), int(rect.height * 0.72)
+            brect = pygame.Rect(0, 0, bw, bh)
+            brect.midright = (right_edge, rect.centery)
+            pygame.draw.rect(self.screen, VIOLET_DARK, brect, border_radius=12)
+            pygame.draw.rect(self.screen, VIOLET, brect, width=3, border_radius=12)
+            label = self.font_mid.render(f"SWITCH ({len(g.bench)})", True, WHITE)
+            self.screen.blit(label, label.get_rect(center=brect.center))
+            self.buttons.append(Button(brect, self._open_bench))
+            right_edge = brect.left - 12
+
+        if active and g.potions > 0:
+            pw, ph = int(rect.height * 1.7), int(rect.height * 0.72)
+            prect = pygame.Rect(0, 0, pw, ph)
+            prect.midright = (right_edge, rect.centery)
+            pygame.draw.rect(self.screen, TEAL_DARK, prect, border_radius=12)
+            pygame.draw.rect(self.screen, TEAL, prect, width=3, border_radius=12)
+            label = self.font_mid.render(f"POTION ({g.potions})", True, WHITE)
+            self.screen.blit(label, label.get_rect(center=prect.center))
+            self.buttons.append(Button(prect, self.game.use_potion))
+
+        # Small ownership icons so equipment status is visible at a glance.
+        eq_size = rect.height * 0.32
+        eq_x = rect.right - eq_size * 0.7
+        eq_y = rect.y + eq_size * 0.65
+        if g.has_sword:
+            draw_sword(self.screen, (eq_x, eq_y), eq_size)
+            eq_x -= eq_size * 1.1
+        if g.has_shield:
+            draw_shield(self.screen, (eq_x, eq_y), eq_size)
+
+    def _open_bench(self):
+        self.game.show_bench = True
+
+    def draw_monster_card(self, rect, card):
+        panel(self.screen, rect, border=RED_DARK, fill=(36, 25, 27))
+        icon_c = (rect.centerx, rect.y + rect.height * 0.32)
+        draw_skull(self.screen, icon_c, rect.height * 0.44, RED)
+        name = self.font_big.render(card["name"], True, TEXT)
+        self.screen.blit(name, name.get_rect(center=(rect.centerx, rect.y + rect.height * 0.62)))
+        stats = f"HP {card['hp']}   Lv {card['capture_level']}   {card['xp_value']}xp"
+        st = self.font_sm.render(stats, True, MUTED)
+        self.screen.blit(st, st.get_rect(center=(rect.centerx, rect.y + rect.height * 0.76)))
+        if self.game.catchable(card):
+            tag = self.font_sm.render("catchable now", True, GOLD)
+            self.screen.blit(tag, tag.get_rect(center=(rect.centerx, rect.bottom - 18)))
+        elif self.game.capture_balls <= 0:
+            tag = self.font_sm.render("no capture balls!", True, RED)
+            self.screen.blit(tag, tag.get_rect(center=(rect.centerx, rect.bottom - 18)))
+
+    def draw_potion_card(self, rect, card):
+        panel(self.screen, rect, border=TEAL_DARK, fill=(22, 34, 32))
+        icon_c = (rect.centerx, rect.y + rect.height * 0.34)
+        draw_potion(self.screen, icon_c, rect.height * 0.48, TEAL)
+        label = self.font_big.render("Potion", True, TEXT)
+        self.screen.blit(label, label.get_rect(center=(rect.centerx, rect.y + rect.height * 0.68)))
+        st = self.font_sm.render(f"heals {card['heal']} HP", True, MUTED)
+        self.screen.blit(st, st.get_rect(center=(rect.centerx, rect.y + rect.height * 0.80)))
+
+    def draw_ball_card(self, rect, card):
+        panel(self.screen, rect, border=VIOLET_DARK, fill=(28, 26, 40))
+        icon_c = (rect.centerx, rect.y + rect.height * 0.32)
+        draw_ball(self.screen, icon_c, rect.height * 0.44, VIOLET)
+        label = self.font_big.render("Capture Ball", True, TEXT)
+        self.screen.blit(label, label.get_rect(center=(rect.centerx, rect.y + rect.height * 0.66)))
+        st = self.font_sm.render(f"+{card['boost']} Capture Lv", True, MUTED)
+        self.screen.blit(st, st.get_rect(center=(rect.centerx, rect.y + rect.height * 0.78)))
+
+    def draw_resolved_overlay(self, rect):
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        overlay.fill((10, 11, 16, 195))
+        self.screen.blit(overlay, rect.topleft)
+        check = self.font_xl.render("DONE", True, GREEN_FRIENDLY)
+        self.screen.blit(check, check.get_rect(center=rect.center))
+
+    def draw_cards(self, area):
+        rects = self.card_rects(area, len(self.game.cards))
+        for rect, card in zip(rects, self.game.cards):
+            if card["type"] == "monster":
+                self.draw_monster_card(rect, card)
+            elif card["type"] == "potion":
+                self.draw_potion_card(rect, card)
+            else:
+                self.draw_ball_card(rect, card)
+            if card.get("resolved"):
+                self.draw_resolved_overlay(rect)
+            else:
+                self.buttons.append(Button(rect, (lambda c=card: self.game.tap_card(c))))
+
+    def draw_pending_overlay(self):
+        w, h = self.size()
+        g = self.game
+        card = g.pending_monster
+        catchable = g.catchable(card)
+        can_battle = g.active is not None
+        can_fight = (not can_battle) and g.has_sword and g.player_hp > 0
+
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        self.screen.blit(overlay, (0, 0))
+        box = pygame.Rect(0, 0, min(600, int(w * 0.88)), int(h * 0.58))
+        box.center = (w // 2, h // 2)
+        panel(self.screen, box, radius=18)
+        draw_skull(self.screen, (box.centerx, box.y + box.height * 0.16), box.height * 0.2, RED)
+        title = self.font_big.render(card["name"], True, TEXT)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + box.height * 0.29)))
+
+        # Monster HP bar.
+        bar_w = int(box.width * 0.7)
+        mbar = pygame.Rect(0, 0, bar_w, int(box.height * 0.06))
+        mbar.center = (box.centerx, box.y + int(box.height * 0.37))
+        draw_hp_bar(self.screen, mbar, card["hp"], card["max_hp"])
+        mtxt = self.font_tiny.render(f"{card['hp']}/{card['max_hp']} HP", True, MUTED)
+        self.screen.blit(mtxt, mtxt.get_rect(center=(box.centerx, mbar.bottom + 12)))
+
+        if not catchable and g.capture_balls <= 0:
+            subtitle = "No Capture Balls left - can't catch this one."
+        elif catchable and can_battle:
+            subtitle = "Catch it, battle it, or flee?"
+        elif catchable:
+            subtitle = "Catchable now. Battle needs an active monster."
+        elif can_battle:
+            subtitle = "Capture Level too low to catch - battle or flee?"
+        elif can_fight:
+            subtitle = "No active monster - fight it yourself, or flee?"
+        else:
+            subtitle = "Too tough right now - flee is your only option."
+        sub = self.font_sm.render(subtitle, True, MUTED)
+        self.screen.blit(sub, sub.get_rect(center=(box.centerx, mbar.bottom + 34)))
+
+        actions = []
+        if catchable:
+            actions.append(("catch", "CATCH", TEAL_DARK, TEAL))
+        if can_battle:
+            actions.append(("battle", "BATTLE", RED_DARK, RED))
+        if can_fight:
+            actions.append(("fight", "FIGHT (SWORD)", GOLD_DARK, GOLD))
+        actions.append(("flee", "FLEE", FLEE_FILL, PANEL_BORDER_LIT))
+
+        n = len(actions)
+        btn_gap = int(box.width * 0.03)
+        cols = 2 if n > 2 else n
+        rows = (n + cols - 1) // cols
+        btn_w = int((box.width - int(box.width * 0.1) - btn_gap * (cols - 1)) / cols)
+        btn_h = int(box.height * 0.16)
+        start_x = box.x + int(box.width * 0.05)
+        by0 = box.bottom - rows * (btn_h + 12) - 10
+        for i, (choice, text, fill, border) in enumerate(actions):
+            r, c = divmod(i, cols)
+            rect = pygame.Rect(start_x + c * (btn_w + btn_gap), by0 + r * (btn_h + 12), btn_w, btn_h)
+            pygame.draw.rect(self.screen, fill, rect, border_radius=14)
+            pygame.draw.rect(self.screen, border, rect, width=3, border_radius=14)
+            t = self.font_mid.render(text, True, WHITE)
+            self.screen.blit(t, t.get_rect(center=rect.center))
+            self.buttons.append(Button(rect, (lambda ch=choice: self.game.resolve_pending(ch))))
+
+    def draw_bench_overlay(self):
+        w, h = self.size()
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+        margin = int(h * 0.06)
+        box = pygame.Rect(margin, margin, w - 2 * margin, h - 2 * margin)
+        panel(self.screen, box, radius=18)
+
+        title = self.font_xl.render("Choose your active monster", True, TEXT)
+        self.screen.blit(title, (box.x + 24, box.y + 18))
+
+        close = pygame.Rect(0, 0, 56, 56)
+        close.topright = (box.right - 18, box.y + 16)
+        pygame.draw.rect(self.screen, RED_DARK, close, border_radius=12)
+        pygame.draw.rect(self.screen, RED, close, width=3, border_radius=12)
+        xt = self.font_big.render("X", True, WHITE)
+        self.screen.blit(xt, xt.get_rect(center=close.center))
+        self.buttons.append(Button(close, lambda: setattr(self.game, "show_bench", False)))
+
+        rows_top = box.y + int(box.height * 0.18)
+        bench = self.game.bench
+        row_gap = 14
+        row_h = min(90, (box.height - (rows_top - box.y) - 20 - row_gap * len(bench)) // max(1, len(bench)))
+        y = rows_top
+        for idx, mon in bench:
+            row = pygame.Rect(box.x + 20, y, box.width - 40, row_h)
+            pygame.draw.rect(self.screen, (24, 27, 40), row, border_radius=12)
+            pygame.draw.rect(self.screen, PANEL_BORDER_LIT, row, width=2, border_radius=12)
+            draw_skull(self.screen, (row.x + row_h * 0.5, row.centery), row_h * 0.8, GREEN_FRIENDLY)
+            name = self.font_big.render(mon["name"], True, TEXT)
+            self.screen.blit(name, (row.x + row_h + 10, row.y + row_h * 0.18))
+            hp = self.font_sm.render(f"HP {mon['hp']}/{mon['max_hp']}", True, MUTED)
+            self.screen.blit(hp, (row.x + row_h + 10, row.y + row_h * 0.58))
+            self.buttons.append(Button(row, (lambda i=idx: self.game.switch_active(i))))
+            y += row_h + row_gap
+
+    def draw_shop_overlay(self):
+        w, h = self.size()
+        g = self.game
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+        margin = int(h * 0.06)
+        box = pygame.Rect(margin, margin, w - 2 * margin, h - 2 * margin)
+        panel(self.screen, box, border=GOLD, radius=18)
+
+        title = self.font_xl.render("Shop", True, GOLD)
+        self.screen.blit(title, (box.x + 24, box.y + 14))
+        coin_c = (box.x + 24 + title.get_width() + 26, box.y + 14 + title.get_height() // 2)
+        draw_coin(self.screen, coin_c, 26, GOLD)
+        bal = self.font_big.render(f"{g.credits} credits", True, TEXT)
+        self.screen.blit(bal, (coin_c[0] + 20, box.y + 14 + title.get_height() // 2 - bal.get_height() // 2))
+
+        close = pygame.Rect(0, 0, 56, 56)
+        close.topright = (box.right - 18, box.y + 16)
+        pygame.draw.rect(self.screen, RED_DARK, close, border_radius=12)
+        pygame.draw.rect(self.screen, RED, close, width=3, border_radius=12)
+        xt = self.font_big.render("X", True, WHITE)
+        self.screen.blit(xt, xt.get_rect(center=close.center))
+        self.buttons.append(Button(close, self.game.close_shop))
+
+        icon_fns = {"ball": draw_ball, "potion": draw_potion, "sword": draw_sword, "shield": draw_shield}
+        icon_colors = {"ball": VIOLET, "potion": TEAL, "sword": (214, 214, 224), "shield": TEAL}
+
+        rows_top = box.y + int(box.height * 0.2)
+        row_gap = 16
+        row_h = min(110, (box.height - (rows_top - box.y) - 20 - row_gap * len(SHOP_ITEMS)) // len(SHOP_ITEMS))
+        y = rows_top
+        for item in SHOP_ITEMS:
+            row = pygame.Rect(box.x + 20, y, box.width - 40, row_h)
+            pygame.draw.rect(self.screen, (24, 27, 40), row, border_radius=12)
+            pygame.draw.rect(self.screen, PANEL_BORDER_LIT, row, width=2, border_radius=12)
+            icon_fns[item["key"]](self.screen, (row.x + row_h * 0.5, row.centery), row_h * 0.7,
+                                   icon_colors[item["key"]])
+            tx = row.x + row_h + 10
+            label = self.font_big.render(item["label"], True, TEXT)
+            self.screen.blit(label, (tx, row.y + row_h * 0.14))
+            for j, line in enumerate(wrap_text(item["desc"], self.font_tiny, row.width - row_h - 220)):
+                dtxt = self.font_tiny.render(line, True, MUTED)
+                self.screen.blit(dtxt, (tx, row.y + row_h * 0.5 + j * 18))
+
+            owned = (item["key"] == "sword" and g.has_sword) or (item["key"] == "shield" and g.has_shield)
+            btn_w, btn_h = 150, min(56, int(row_h * 0.6))
+            brect = pygame.Rect(0, 0, btn_w, btn_h)
+            brect.midright = (row.right - 16, row.centery)
+            if owned:
+                pygame.draw.rect(self.screen, PANEL_BORDER, brect, border_radius=12)
+                bt = self.font_sm.render("OWNED", True, MUTED)
+                self.screen.blit(bt, bt.get_rect(center=brect.center))
+            else:
+                affordable = g.credits >= item["cost"]
+                fill = GOLD_DARK if affordable else (40, 40, 46)
+                border = GOLD if affordable else PANEL_BORDER
+                pygame.draw.rect(self.screen, fill, brect, border_radius=12)
+                pygame.draw.rect(self.screen, border, brect, width=3, border_radius=12)
+                bt = self.font_sm.render(f"BUY {item['cost']}", True, WHITE if affordable else MUTED)
+                self.screen.blit(bt, bt.get_rect(center=brect.center))
+                self.buttons.append(Button(brect, (lambda k=item["key"]: self.game.buy_item(k))))
+            y += row_h + row_gap
+
+    def draw_help_overlay(self):
+        w, h = self.size()
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 210))
+        self.screen.blit(overlay, (0, 0))
+        margin = int(h * 0.05)
+        box = pygame.Rect(margin, margin, w - 2 * margin, h - 2 * margin)
+        panel(self.screen, box, border=VIOLET, radius=18)
+
+        title = self.font_xl.render("HOW TO PLAY", True, VIOLET)
+        self.screen.blit(title, (box.x + 24, box.y + 14))
+
+        close = pygame.Rect(0, 0, 56, 56)
+        close.topright = (box.right - 18, box.y + 16)
+        pygame.draw.rect(self.screen, RED_DARK, close, border_radius=12)
+        pygame.draw.rect(self.screen, RED, close, width=3, border_radius=12)
+        xt = self.font_big.render("X", True, WHITE)
+        self.screen.blit(xt, xt.get_rect(center=close.center))
+        self.buttons.append(Button(close, self.game.close_help))
+
+        body_w = box.width - 48
+        y = box.y + int(box.height * 0.15)
+        bottom_limit = box.bottom - 16
+        for heading, text in HELP_SECTIONS:
+            if y >= bottom_limit:
+                break
+            ht = self.font_sm.render(heading, True, GOLD)
+            self.screen.blit(ht, (box.x + 24, y))
+            y += ht.get_height() + 3
+            for line in wrap_text(text, self.font_tiny, body_w):
+                if y >= bottom_limit:
+                    break
+                lt = self.font_tiny.render(line, True, TEXT)
+                self.screen.blit(lt, (box.x + 24, y))
+                y += lt.get_height() + 2
+            y += 10
+
+    def draw_quest_complete_overlay(self):
+        w, h = self.size()
+        g = self.game
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 190))
+        self.screen.blit(overlay, (0, 0))
+        box = pygame.Rect(0, 0, min(560, int(w * 0.82)), int(h * 0.42))
+        box.center = (w // 2, h // 2)
+        panel(self.screen, box, border=GOLD, radius=18)
+        draw_star(self.screen, (box.centerx, box.y + box.height * 0.26), box.height * 0.3, GOLD)
+        title = self.font_big.render("Quest Complete!", True, GOLD)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + box.height * 0.48)))
+        nxt = self.font_sm.render(f"Next up: {g.next_quest_title}", True, TEXT)
+        self.screen.blit(nxt, nxt.get_rect(center=(box.centerx, box.y + box.height * 0.62)))
+        btn = pygame.Rect(0, 0, int(box.width * 0.5), int(box.height * 0.22))
+        btn.midbottom = (box.centerx, box.bottom - 20)
+        pygame.draw.rect(self.screen, GOLD, btn, border_radius=14)
+        t = self.font_mid.render("CONTINUE", True, BLACK)
+        self.screen.blit(t, t.get_rect(center=btn.center))
+        self.buttons.append(Button(btn, g.continue_after_quest))
+
+    def draw_game_over_overlay(self):
+        w, h = self.size()
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 210))
+        self.screen.blit(overlay, (0, 0))
+        box = pygame.Rect(0, 0, min(560, int(w * 0.82)), int(h * 0.46))
+        box.center = (w // 2, h // 2)
+        panel(self.screen, box, border=RED, radius=18)
+        draw_skull(self.screen, (box.centerx, box.y + box.height * 0.22), box.height * 0.28, RED)
+        for i, line in enumerate(wrap_text(self.game.game_over_msg, self.font_big, box.width - 40)):
+            t = self.font_big.render(line, True, TEXT)
+            self.screen.blit(t, t.get_rect(center=(box.centerx, box.y + box.height * 0.46 + i * 30)))
+        self._draw_again_change_buttons(box)
+
+    def draw_victory_overlay(self):
+        w, h = self.size()
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 210))
+        self.screen.blit(overlay, (0, 0))
+        box = pygame.Rect(0, 0, min(560, int(w * 0.85)), int(h * 0.46))
+        box.center = (w // 2, h // 2)
+        panel(self.screen, box, border=GOLD, radius=18)
+        draw_star(self.screen, (box.centerx, box.y + box.height * 0.22), box.height * 0.28, GOLD)
+        title = self.font_big.render("VICTORY!", True, GOLD)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + box.height * 0.42)))
+        for i, line in enumerate(wrap_text(self.game.victory_msg, self.font_mid, box.width - 40)):
+            t = self.font_mid.render(line, True, TEXT)
+            self.screen.blit(t, t.get_rect(center=(box.centerx, box.y + box.height * 0.55 + i * 26)))
+        self._draw_again_change_buttons(box)
+
+    def _draw_again_change_buttons(self, box):
+        btn_w, btn_h = int(box.width * 0.42), int(box.height * 0.2)
+        again_rect = pygame.Rect(box.x + int(box.width * 0.05), box.bottom - btn_h - 20, btn_w, btn_h)
+        change_rect = pygame.Rect(box.right - int(box.width * 0.05) - btn_w, box.bottom - btn_h - 20, btn_w, btn_h)
+        pygame.draw.rect(self.screen, GOLD, again_rect, border_radius=12)
+        at = self.font_mid.render("PLAY AGAIN", True, BLACK)
+        self.screen.blit(at, at.get_rect(center=again_rect.center))
+        pygame.draw.rect(self.screen, VIOLET_DARK, change_rect, border_radius=12)
+        pygame.draw.rect(self.screen, VIOLET, change_rect, width=3, border_radius=12)
+        ct = self.font_mid.render("CHANGE MODE", True, WHITE)
+        self.screen.blit(ct, ct.get_rect(center=change_rect.center))
+        self.buttons.append(Button(again_rect, self.game.play_again))
+        self.buttons.append(Button(change_rect, self.game.change_mode))
+
+    def draw_quit_confirm_overlay(self):
+        w, h = self.size()
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+        box = pygame.Rect(0, 0, min(460, int(w * 0.8)), int(h * 0.34))
+        box.center = (w // 2, h // 2)
+        panel(self.screen, box, border=RED, radius=18)
+        title = self.font_big.render("Quit the game?", True, TEXT)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + box.height * 0.3)))
+        sub = self.font_sm.render("Unsaved progress in this run will be lost.", True, MUTED)
+        self.screen.blit(sub, sub.get_rect(center=(box.centerx, box.y + box.height * 0.5)))
+
+        btn_w, btn_h = int(box.width * 0.38), int(box.height * 0.28)
+        yes_rect = pygame.Rect(box.x + int(box.width * 0.07), box.bottom - btn_h - 20, btn_w, btn_h)
+        no_rect = pygame.Rect(box.right - int(box.width * 0.07) - btn_w, box.bottom - btn_h - 20, btn_w, btn_h)
+
+        pygame.draw.rect(self.screen, RED_DARK, yes_rect, border_radius=14)
+        pygame.draw.rect(self.screen, RED, yes_rect, width=3, border_radius=14)
+        yt = self.font_mid.render("YES, QUIT", True, WHITE)
+        self.screen.blit(yt, yt.get_rect(center=yes_rect.center))
+
+        pygame.draw.rect(self.screen, TEAL_DARK, no_rect, border_radius=14)
+        pygame.draw.rect(self.screen, TEAL, no_rect, width=3, border_radius=14)
+        nt = self.font_mid.render("KEEP PLAYING", True, WHITE)
+        self.screen.blit(nt, nt.get_rect(center=no_rect.center))
+
+        self.buttons.append(Button(yes_rect, lambda: sys.exit(0)))
+        self.buttons.append(Button(no_rect, self.game.close_quit_confirm))
+
+    def draw(self):
+        self.screen.fill(BG)
+        self.buttons = []
+        if self.game.mode is None:
+            self.draw_mode_select()
+        elif self.game.mode == "classic_select":
+            self.draw_classic_select()
+        else:
+            status, toast, active_bar, quest_bar, cards_area = self.layout()
+            self.draw_status_bar(status)
+            self.draw_toast(toast)
+            self.draw_active_bar(active_bar)
+            if quest_bar:
+                self.draw_quest_bar(quest_bar)
+            self.draw_cards(cards_area)
+            # Each of these overlays is drawn opaque on top of everything
+            # above. Without clearing self.buttons first, a tap in the
+            # darkened area outside the overlay's own box could still hit
+            # a "hidden" button from underneath (e.g. SAVE or a card) that
+            # the player can no longer see - clearing keeps taps in sync
+            # with what's actually on screen.
+            if self.game.show_bench:
+                self.buttons = []
+                self.draw_bench_overlay()
+            elif self.game.show_shop:
+                self.buttons = []
+                self.draw_shop_overlay()
+            elif self.game.pending_monster:
+                self.buttons = []
+                self.draw_pending_overlay()
+            elif self.game.quest_complete:
+                self.buttons = []
+                self.draw_quest_complete_overlay()
+            elif self.game.game_over_msg:
+                self.buttons = []
+                self.draw_game_over_overlay()
+            elif self.game.victory_msg:
+                self.buttons = []
+                self.draw_victory_overlay()
+        # Help is reachable from every screen (mode select, difficulty
+        # picker, and gameplay), so it's handled outside the branches
+        # above, same as the quit confirmation.
+        if self.game.show_help:
+            self.buttons = []
+            self.draw_help_overlay()
+        if self.game.confirm_quit:
+            self.buttons = []
+            self.draw_quit_confirm_overlay()
+        pygame.display.flip()
+
+    def handle_tap(self, pos):
+        for btn in reversed(self.buttons):
+            if btn.hit(pos):
+                btn.on_tap()
+                return
+
+    def run(self):
+        running = True
+        while running:
+            # Only the first tap in a frame acts - the button list on
+            # screen corresponds to the last draw(), so a second tap
+            # event arriving before the next draw() (e.g. a duplicate
+            # touch/mouse event for one physical tap) would be acting
+            # on stale buttons. Ignoring it until the next frame is
+            # redrawn keeps every tap safely in sync with what's shown.
+            tapped_this_frame = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                    self._build_fonts()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_F11:
+                        pygame.display.toggle_fullscreen()
+                        self._build_fonts()
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not tapped_this_frame:
+                    tapped_this_frame = True
+                    self._safe_tap(event.pos)
+                elif event.type == pygame.FINGERDOWN and not tapped_this_frame:
+                    tapped_this_frame = True
+                    w, h = self.size()
+                    pos = (int(event.x * w), int(event.y * h))
+                    self._safe_tap(pos)
+            self.draw()
+            self.clock.tick(FPS)
+        pygame.quit()
+
+    def _safe_tap(self, pos):
+        # A confirmed quit (YES, QUIT) is meant to end the app - let that
+        # SystemExit through. Anything else that goes wrong in a tap
+        # handler is swallowed so one bad tap can never silently kill
+        # the whole game.
+        try:
+            self.handle_tap(pos)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(f"Ignored error handling tap: {exc}")
+
+
+def main():
+    try:
+        App().run()
+    except KeyboardInterrupt:
+        pygame.quit()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
