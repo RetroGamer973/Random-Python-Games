@@ -1,0 +1,339 @@
+"""
+Space Shooter - Touch Edition for Pydroid 3 (Android)
+
+SETUP:
+  1. Open Pydroid 3
+  2. Pip menu -> search "pygame" -> Install
+     (if that fails, try "pygame-ce" instead)
+  3. Load this file and press Play
+
+CONTROLS (basic on-screen buttons, bottom of screen):
+  [ < ]  [ > ]              [ FIRE ]
+  left     right              shoot
+"""
+
+import pygame
+import random
+import sys
+
+pygame.init()
+
+# Create the window in fullscreen FIRST, then read its real size.
+# (pygame.display.Info() before set_mode() often returns 0,0 on Android,
+# which was causing the game to draw at the wrong resolution.)
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+WIDTH, HEIGHT = screen.get_size()
+if WIDTH < 100 or HEIGHT < 100:
+    # extreme fallback, should not normally trigger
+    WIDTH, HEIGHT = 480, 800
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+
+pygame.display.set_caption("Space Shooter")
+clock = pygame.time.Clock()
+FPS = 60
+
+BLACK = (10, 10, 20)
+WHITE = (255, 255, 255)
+GREEN = (60, 230, 110)
+RED = (230, 60, 60)
+YELLOW = (240, 220, 80)
+BTN_COLOR = (80, 80, 100)
+BTN_ACTIVE = (90, 200, 130)
+BTN_BORDER = (255, 255, 255)
+
+SCALE = WIDTH / 480
+def sc(v):
+    return int(v * SCALE)
+
+font = pygame.font.SysFont(None, sc(30))
+big_font = pygame.font.SysFont(None, sc(56))
+btn_font = pygame.font.SysFont(None, sc(40))
+
+PLAYER_SPEED = sc(6)
+BULLET_SPEED = sc(10)
+ENEMY_BULLET_SPEED = sc(6)
+ENEMY_ROWS = 4
+ENEMY_COLS = 6
+ENEMY_H_GAP = sc(60)
+ENEMY_V_GAP = sc(45)
+ENEMY_DROP = sc(18)
+ENEMY_SHOOT_CHANCE = 0.0025
+
+# ---------- Layout: reserve a clear button bar at the bottom ----------
+# Use a fixed fraction of real screen height so it's always visible
+# regardless of device resolution.
+BAR_HEIGHT = int(HEIGHT * 0.16)
+BAR_TOP = HEIGHT - BAR_HEIGHT
+PLAY_BOTTOM = BAR_TOP - sc(10)   # player and enemies never go below this line
+
+btn_w = int(WIDTH * 0.22)
+btn_h = int(BAR_HEIGHT * 0.7)
+btn_y = BAR_TOP + (BAR_HEIGHT - btn_h) // 2
+btn_margin = int(WIDTH * 0.04)
+
+left_btn = pygame.Rect(btn_margin, btn_y, btn_w, btn_h)
+right_btn = pygame.Rect(btn_margin * 2 + btn_w, btn_y, btn_w, btn_h)
+fire_btn = pygame.Rect(WIDTH - btn_w - btn_margin, btn_y, btn_w, btn_h)
+
+
+class Player:
+    def __init__(self):
+        self.w, self.h = sc(46), sc(30)
+        self.x = WIDTH // 2 - self.w // 2
+        self.y = PLAY_BOTTOM - self.h - sc(10)
+        self.lives = 3
+        self.cooldown = 0
+
+    def rect(self):
+        return pygame.Rect(int(self.x), int(self.y), self.w, self.h)
+
+    def draw(self, surf):
+        r = self.rect()
+        pygame.draw.polygon(surf, GREEN, [
+            (r.centerx, r.top),
+            (r.left, r.bottom),
+            (r.right, r.bottom),
+        ])
+        pygame.draw.polygon(surf, WHITE, [
+            (r.centerx, r.top),
+            (r.left, r.bottom),
+            (r.right, r.bottom),
+        ], width=2)
+
+
+class Enemy:
+    def __init__(self, x, y):
+        self.w, self.h = sc(34), sc(24)
+        self.x = x
+        self.y = y
+        self.alive = True
+
+    def rect(self):
+        return pygame.Rect(int(self.x), int(self.y), self.w, self.h)
+
+    def draw(self, surf):
+        pygame.draw.rect(surf, RED, self.rect(), border_radius=sc(4))
+        pygame.draw.circle(surf, YELLOW, (int(self.x) + sc(8), int(self.y) + sc(8)), sc(3))
+        pygame.draw.circle(surf, YELLOW, (int(self.x) + self.w - sc(8), int(self.y) + sc(8)), sc(3))
+
+
+def make_enemies():
+    enemies = []
+    total_w = (ENEMY_COLS - 1) * ENEMY_H_GAP
+    start_x = (WIDTH - total_w) // 2
+    start_y = sc(70)
+    for row in range(ENEMY_ROWS):
+        for col in range(ENEMY_COLS):
+            enemies.append(Enemy(start_x + col * ENEMY_H_GAP, start_y + row * ENEMY_V_GAP))
+    return enemies
+
+
+def reset_game():
+    return {
+        "player": Player(),
+        "enemies": make_enemies(),
+        "player_bullets": [],
+        "enemy_bullets": [],
+        "enemy_dir": 1,
+        "enemy_speed": sc(1.2),
+        "score": 0,
+        "game_over": False,
+        "won": False,
+    }
+
+
+def draw_text_center(surf, text, y, f=font, color=WHITE):
+    t = f.render(text, True, color)
+    surf.blit(t, (WIDTH // 2 - t.get_width() // 2, y))
+
+
+def draw_button(surf, rect, label, active):
+    color = BTN_ACTIVE if active else BTN_COLOR
+    pygame.draw.rect(surf, color, rect, border_radius=sc(10))
+    pygame.draw.rect(surf, BTN_BORDER, rect, width=2, border_radius=sc(10))
+    t = btn_font.render(label, True, WHITE)
+    surf.blit(t, (rect.centerx - t.get_width() // 2, rect.centery - t.get_height() // 2))
+
+
+def get_touch_pos(event):
+    if event.type in (pygame.FINGERDOWN, pygame.FINGERUP, pygame.FINGERMOTION):
+        return (event.x * WIDTH, event.y * HEIGHT)
+    return event.pos
+
+
+def main():
+    state = reset_game()
+    restart_btn = pygame.Rect(WIDTH // 2 - sc(90), HEIGHT // 2 + sc(40), sc(180), sc(60))
+
+    move_left = False
+    move_right = False
+    firing = False
+
+    running = True
+    while running:
+        clock.tick(FPS)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
+                pos = get_touch_pos(event)
+
+                if state["game_over"]:
+                    if restart_btn.collidepoint(pos):
+                        state = reset_game()
+                    continue
+
+                if left_btn.collidepoint(pos):
+                    move_left = True
+                elif right_btn.collidepoint(pos):
+                    move_right = True
+                elif fire_btn.collidepoint(pos):
+                    firing = True
+
+            elif event.type in (pygame.MOUSEBUTTONUP, pygame.FINGERUP):
+                pos = get_touch_pos(event)
+                if left_btn.collidepoint(pos):
+                    move_left = False
+                elif right_btn.collidepoint(pos):
+                    move_right = False
+                elif fire_btn.collidepoint(pos):
+                    firing = False
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_LEFT:
+                    move_left = True
+                if event.key == pygame.K_RIGHT:
+                    move_right = True
+                if event.key == pygame.K_SPACE:
+                    firing = True
+                if event.key == pygame.K_r and state["game_over"]:
+                    state = reset_game()
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+            elif event.type == pygame.KEYUP:
+                if event.key == pygame.K_LEFT:
+                    move_left = False
+                if event.key == pygame.K_RIGHT:
+                    move_right = False
+                if event.key == pygame.K_SPACE:
+                    firing = False
+
+        if not state["game_over"]:
+            player = state["player"]
+            enemies = state["enemies"]
+
+            if move_left:
+                player.x -= PLAYER_SPEED
+            if move_right:
+                player.x += PLAYER_SPEED
+            player.x = max(0, min(WIDTH - player.w, player.x))
+
+            if player.cooldown > 0:
+                player.cooldown -= 1
+            if firing and player.cooldown == 0:
+                state["player_bullets"].append(
+                    pygame.Rect(int(player.x + player.w // 2 - sc(2)), int(player.y), sc(4), sc(12))
+                )
+                player.cooldown = 14
+
+            for b in state["player_bullets"][:]:
+                b.y -= BULLET_SPEED
+                if b.bottom < 0:
+                    state["player_bullets"].remove(b)
+
+            alive_enemies = [e for e in enemies if e.alive]
+            if alive_enemies:
+                edge_hit = any(
+                    (e.x + state["enemy_speed"] * state["enemy_dir"] < 0 or
+                     e.x + e.w + state["enemy_speed"] * state["enemy_dir"] > WIDTH)
+                    for e in alive_enemies
+                )
+                if edge_hit:
+                    state["enemy_dir"] *= -1
+                    for e in alive_enemies:
+                        e.y += ENEMY_DROP
+                else:
+                    for e in alive_enemies:
+                        e.x += state["enemy_speed"] * state["enemy_dir"]
+
+                for e in alive_enemies:
+                    if random.random() < ENEMY_SHOOT_CHANCE:
+                        state["enemy_bullets"].append(
+                            pygame.Rect(int(e.x + e.w // 2 - sc(2)), int(e.y + e.h), sc(4), sc(12))
+                        )
+                    if e.y + e.h >= player.y:
+                        state["game_over"] = True
+                        state["won"] = False
+            else:
+                state["won"] = True
+                state["game_over"] = True
+
+            for b in state["enemy_bullets"][:]:
+                b.y += ENEMY_BULLET_SPEED
+                if b.top > HEIGHT:
+                    state["enemy_bullets"].remove(b)
+
+            for b in state["player_bullets"][:]:
+                for e in alive_enemies:
+                    if e.alive and b.colliderect(e.rect()):
+                        e.alive = False
+                        state["score"] += 10
+                        if b in state["player_bullets"]:
+                            state["player_bullets"].remove(b)
+                        break
+
+            prect = player.rect()
+            for b in state["enemy_bullets"][:]:
+                if b.colliderect(prect):
+                    state["enemy_bullets"].remove(b)
+                    player.lives -= 1
+                    if player.lives <= 0:
+                        state["game_over"] = True
+                        state["won"] = False
+
+        # ---------- draw ----------
+        screen.fill(BLACK)
+
+        for x in range(0, WIDTH, sc(40)):
+            pygame.draw.line(screen, (25, 25, 40), (x, 0), (x, HEIGHT), 1)
+
+        pygame.draw.line(screen, (60, 60, 75), (0, BAR_TOP), (WIDTH, BAR_TOP), 2)
+
+        state["player"].draw(screen)
+        for e in state["enemies"]:
+            if e.alive:
+                e.draw(screen)
+        for b in state["player_bullets"]:
+            pygame.draw.rect(screen, YELLOW, b)
+        for b in state["enemy_bullets"]:
+            pygame.draw.rect(screen, WHITE, b)
+
+        hud = font.render(f"Score: {state['score']}   Lives: {state['player'].lives}", True, WHITE)
+        screen.blit(hud, (sc(10), sc(10)))
+
+        pygame.draw.rect(screen, (35, 35, 50), (0, BAR_TOP, WIDTH, BAR_HEIGHT))
+        pygame.draw.line(screen, (100, 100, 120), (0, BAR_TOP), (WIDTH, BAR_TOP), 3)
+        draw_button(screen, left_btn, "<", move_left)
+        draw_button(screen, right_btn, ">", move_right)
+        draw_button(screen, fire_btn, "FIRE", firing)
+
+        if state["game_over"]:
+            overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 190))
+            screen.blit(overlay, (0, 0))
+            msg = "YOU WIN!" if state["won"] else "GAME OVER"
+            color = GREEN if state["won"] else RED
+            draw_text_center(screen, msg, HEIGHT // 2 - sc(100), big_font, color)
+            draw_text_center(screen, f"Final Score: {state['score']}", HEIGHT // 2 - sc(30))
+            draw_button(screen, restart_btn, "RESTART", False)
+
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
